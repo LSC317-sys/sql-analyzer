@@ -18,46 +18,67 @@ public class ExplainService {
     @Autowired
     private SqlRecordRepository sqlRecordRepository;
 
+    @Autowired
+    private SqlFormatter sqlFormatter;
+
     /**
      * 执行 SQL 分析
      */
     public Map<String, Object> analyzeSql(String sql, String ipAddress) {
+        System.out.println("【DEBUG】收到的SQL: [" + sql + "]");
+        System.out.println("【DEBUG】SQL长度: " + sql.length());
+
         Map<String, Object> result = new HashMap<>();
 
-        // 1. 安全性检查
-        String lowerSql = sql.toLowerCase().trim();
-        if (lowerSql.startsWith("drop") ||
-                lowerSql.startsWith("delete") ||
-                lowerSql.startsWith("update") ||
-                lowerSql.startsWith("insert") ||
-                lowerSql.startsWith("alter") ||
-                lowerSql.startsWith("truncate")) {
-            throw new RuntimeException("⚠️ 仅支持 SELECT 查询，禁止执行数据修改操作");
+        try {
+            // 1. 安全检查
+            String lowerSql = sql.toLowerCase().trim();
+            System.out.println("【DEBUG】安全检查通过");
+
+            if (lowerSql.startsWith("drop") ||
+                    lowerSql.startsWith("delete") ||
+                    lowerSql.startsWith("update") ||
+                    lowerSql.startsWith("insert") ||
+                    lowerSql.startsWith("alter") ||
+                    lowerSql.startsWith("truncate")) {
+                throw new RuntimeException("⚠️ 仅支持 SELECT 查询");
+            }
+
+            // 2. 执行 EXPLAIN
+            String explainSql = "EXPLAIN " + sql;
+            System.out.println("【DEBUG】执行SQL: " + explainSql);
+
+            List<Map<String, Object>> explainResults = jdbcTemplate.queryForList(explainSql);
+            System.out.println("【DEBUG】查询成功，返回 " + explainResults.size() + " 行");
+
+            // 3. 格式化
+            String formattedResult = formatExplainResult(explainResults);
+            result.put("explain", formattedResult);
+            result.put("formattedSql", sqlFormatter.format(sql));
+            result.put("highlightedSql", sqlFormatter.highlight(sql));
+
+            // 4. 建议
+            List<String> suggestions = generateSuggestions(sql, explainResults);
+            result.put("suggestions", suggestions);
+
+            // 5. 保存
+            SqlRecord record = new SqlRecord();
+            record.setSqlText(sql);
+            record.setExplainResult(formattedResult);
+            record.setSuggestions(String.join("\n", suggestions));
+            record.setCreatedAt(LocalDateTime.now());
+            record.setIpAddress(ipAddress);
+            SqlRecord saved = sqlRecordRepository.save(record);
+            result.put("id", saved.getId());
+
+            System.out.println("【DEBUG】分析完成！");
+            return result;
+
+        } catch (Exception e) {
+            System.out.println("【ERROR】分析失败: " + e.getMessage());
+            e.printStackTrace();
+            throw new RuntimeException("分析失败: " + e.getMessage());
         }
-
-        // 2. 执行 EXPLAIN
-        String explainSql = "EXPLAIN " + sql;
-        List<Map<String, Object>> explainResults = jdbcTemplate.queryForList(explainSql);
-
-        // 3. 格式化执行计划
-        String formattedResult = formatExplainResult(explainResults);
-        result.put("explain", formattedResult);
-
-        // 4. 生成优化建议
-        List<String> suggestions = generateSuggestions(sql, explainResults);
-        result.put("suggestions", suggestions);
-
-        // 5. 保存记录
-        SqlRecord record = new SqlRecord();
-        record.setSqlText(sql);
-        record.setExplainResult(formattedResult);
-        record.setSuggestions(String.join("\n", suggestions));
-        record.setCreatedAt(LocalDateTime.now());
-        record.setIpAddress(ipAddress);
-        sqlRecordRepository.save(record);
-        result.put("id", record.getId());
-
-        return result;
     }
 
     /**
@@ -129,6 +150,37 @@ public class ExplainService {
         if (lowerSql.contains("select *")) {
             suggestions.add("💡 [最佳实践] 避免使用 SELECT *，指定需要的字段");
         }
+        // ========== 更多优化建议 ==========
+
+// LIKE 查询优化
+        if (lowerSql.contains("like") && lowerSql.contains("'%")) {
+            suggestions.add("⚠️ [模糊查询] 前缀模糊查询 LIKE '%xxx' 无法使用索引");
+        }
+
+// OR 条件优化
+        if (lowerSql.contains(" or ")) {
+            suggestions.add("💡 [条件优化] 考虑用 UNION ALL 替代 OR，可能更高效");
+        }
+
+// NOT IN 优化
+        if (lowerSql.contains("not in")) {
+            suggestions.add("💡 [条件优化] NOT IN 效率较低，建议改用 NOT EXISTS 或 LEFT JOIN");
+        }
+
+// 子查询优化
+        if (lowerSql.contains("select") && lowerSql.indexOf("select") != lowerSql.lastIndexOf("select")) {
+            suggestions.add("💡 [子查询] 存在嵌套查询，考虑改用 JOIN 提升性能");
+        }
+
+// DISTINCT 优化
+        if (lowerSql.contains("distinct")) {
+            suggestions.add("💡 [去重] DISTINCT 会产生临时表，确保必要或改用 GROUP BY");
+        }
+
+// LIMIT 建议
+        if (!lowerSql.contains("limit") && lowerSql.contains("select")) {
+            suggestions.add("💡 [分页] 建议添加 LIMIT 防止返回过多数据");
+        }
 
         if (suggestions.isEmpty()) {
             suggestions.add("✅ 执行计划良好，未检测到明显性能问题");
@@ -142,5 +194,9 @@ public class ExplainService {
      */
     public List<SqlRecord> getHistory() {
         return sqlRecordRepository.findTop20ByOrderByCreatedAtDesc();
+    }
+
+    public SqlRecord getById(Long id) {
+        return sqlRecordRepository.findById(id).orElse(null);
     }
 }
